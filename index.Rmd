@@ -1,0 +1,149 @@
+---
+title: South Pacific invasive alien species gap analysis in DNA barcode reference libraries
+date: "`r Sys.Date()`"
+author: Pieter Provoost
+output: rmdformats::robobook
+editor_options: 
+  chunk_output_type: console
+---
+
+## Introduction
+
+The goal of this analysis is to find out if there are any gaps in sequence reference databases for species that are of interest to the PacMAN project.
+
+This notebook makes use of the [caspr](https://github.com/iobis/caspr) package, which is a set of R functions created to support data analysis within the PacMAN project.
+
+## Region of interest
+
+```{r message=FALSE, warning=FALSE}
+library(caspr)
+library(sf)
+library(dplyr)
+
+library(leaflet)
+
+leaflet() %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  addPolygons(data = st_as_sfc(wkt_south_pacific, crs = 4326), color = "#ff9900")
+```
+
+## Creating the species checklist
+
+Let's first get the expert priority species lists, which are [managed by the PacMAN team on GitHub](https://github.com/iobis/pacman/tree/main/SpeciesLists), as well as a checklist for the South Pacific based on the OBIS database and the World Register of Introduced Marine Species (WRiMS). The checklists are merged to obtain a single checklist.
+
+```{r message=FALSE}
+cl_expert <- expert_checklists(enhance = TRUE) %>%
+  select(taxonID, scientificName, taxonRank, phylum, references, remarks)
+cl_obis <- obis_checklist()
+
+cl <- cl_obis %>%
+  full_join(cl_expert) %>%
+  filter(taxonRank == "Species")
+```
+
+This gives us a checklist with `r nrow(cl)` species from `r length(unique(cl$phylum))` phyla. Of these species, `r nrow(cl_expert %>% filter(taxonRank == "Species"))` are on the expert priority species lists.
+
+```{r warning=FALSE, message=FALSE}
+library(ggplot2)
+
+phylum_stats <- cl %>%
+  group_by(phylum) %>%
+  summarize(species = n()) %>%
+  arrange(desc(species))
+
+ggplot() +
+  geom_histogram(data = phylum_stats, aes(x = reorder(phylum, -species), y = species), stat = "identity") +
+  xlab("phylum") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+```
+
+## Checking BOLD for sequences
+
+Of the `r nrow(cl)` species in our checklist, `r sum(!is.na(cl$bold_id))` have a BOLD identifier in the WoRMS database, but in this first implementation we are querying BOLD by taxon name and not by identifier.
+
+Let's get the number of sequences in BOLD by species and marker:
+
+```{r}
+library(bold)
+library(purrr)
+library(progress)
+
+if (file.exists("df_bold.rds")) {
+  df_bold <- readRDS("df_bold.rds")
+} else {
+  bold_list <- sapply(cl$species, function(x) NULL)
+  pb <- progress_estimated(nrow(cl))
+  for (i in 1:length(cl$species)) {
+    if (is.null(bold_list[[i]])) {
+      taxon <- cl$species[i]
+      bold_list[[i]] <- caspr::bold_statistics(taxon)  
+    }
+    pb$tick()$print()
+  }
+  df_bold <- bind_rows(bold_list, .id = "id")
+  saveRDS(df_bold, "df_bold.rds")
+}
+```
+
+This gives us a table with `r length(unique(df_bold$markercode))` distinct marker codes and `r length(unique(df_bold$id))` species.
+
+```{r warning=FALSE, message=FALSE}
+marker_stats <- df_bold %>%
+  group_by(markercode) %>%
+  summarize(species = n(), sequences = sum(sequences))
+
+ggplot() +
+  geom_histogram(data = marker_stats, aes(x = reorder(markercode, -species), y = species), stat = "identity") +
+  xlab("marker") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+```
+
+Let's take a look at the completeness by phylum. For this analysis I'm verifying that for each taxon at least one of the following markers is present: COI, 18S, rbcL, matK ^[Duarte S, Vieira PE, Costa FO (2020) Assessment of species gaps in DNA barcode libraries of non-indigenous species (NIS) occurring in European coastal regions. Metabarcoding and Metagenomics 4: e55162. https://doi.org/10.3897/mbmg.4.55162].
+
+```{r warning=FALSE, message=FALSE}
+selected_markers <- c("COI-5P", "18S", "rbcL", "rbcLa", "matK")
+
+df_bold <- cl %>%
+  left_join(df_bold, by = c("scientificName" = "id")) %>%
+  mutate(has_barcode = markercode %in% selected_markers)
+
+species_barcode_stats <- df_bold %>%
+  group_by(phylum, species, records) %>%
+  summarize(has_barcode = as.logical(max(has_barcode)))
+
+phylum_barcode_stats <- species_barcode_stats %>%
+  group_by(phylum, has_barcode) %>%
+  summarize(species = n()) %>%
+  arrange(desc(has_barcode))
+
+ggplot() +
+  geom_histogram(data = phylum_barcode_stats, aes(x = phylum, y = species, fill = has_barcode), stat = "identity") +
+  scale_fill_grey(start = 0.7, end = 0.3) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+```
+
+Let's check which species without barcodes have the most occurrences in OBIS. This table gives the five most abundant species for each phylum:
+
+```{r message=FALSE, warning=FALSE}
+library(knitr)
+
+missing_barcodes <- species_barcode_stats %>%
+  filter(has_barcode == FALSE)
+
+missing_barcodes %>%
+  arrange(phylum, desc(records)) %>%
+  group_by(phylum) %>%
+  slice_head(n = 5) %>%
+  kable()
+```
+
+## Checking NCBI for sequences
+
+To do.
+
+## Issues to be resolved
+
+- limit checklist to species introduced in the region
+- query BOLD by taxon ID if available
+- NCBI
+- create priority list for barcoding specimens
